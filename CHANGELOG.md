@@ -18,6 +18,10 @@ diskOS remains beta software; version numbers do not imply broad hardware or fea
 - Now Playing, Home, the screensaver, and Last.fm showed the filename as the title for Ogg Opus,
   because the stock player reports the filename when it reads no title. diskOS now uses the
   library's tag title for that file instead.
+- Ogg Opus and Vorbis files with an embedded cover over about 190 KB were listed by filename under
+  "Unknown artist": the tag reader stopped after 64 Ogg pages, and encoders write the cover in ~4 KB
+  pages. Tags are now read as a stream, skipping the cover, so cover size no longer matters. A file
+  the reader can't finish within its bounds keeps its stored tags instead of getting filename ones.
 
 ## [1.2.0] - 2026-10-02
 

@@ -112,7 +112,8 @@ static int unescape(const char*s,int n,char*dst,int dstsz){
 /* Stock V2.57 sends the bare filename as song_name when its decoder wrapper reads no title, e.g. for Ogg Opus.
  * Swap in the scanner's tag TITLE (mdb_tag_title_by_path) as the track is PUBLISHED, so consumers never see the
  * title change mid-track (a title change reads as a new track to the play-start confirm and to Last.fm). One
- * lookup per path, cached whether or not it found a title. Caller must hold g_mu. */
+ * lookup per path, cached whether or not it found a title. IPC thread only, and NOT under g_mu: the lookup opens
+ * the library DB, and the UI thread takes g_mu every frame (ipc_get_state). */
 static char g_tfix_path[256], g_tfix_title[160];
 static int  g_tfix_ok;
 static void fix_filename_title(char *title, int cap, const char *path){
@@ -139,14 +140,13 @@ static void parse_a2(const char*payload,int len){
     jsmn_init(&p);
     int nt=jsmn_parse(&p,payload,len,tk,64);
     if(nt<1) return;
-    pthread_mutex_lock(&g_mu);
-    char oldpath[256]; snprintf(oldpath, sizeof oldpath, "%s", g_state.path);   /* detect a track-identity change */
-    int v;
-    v=find_val(payload,tk,nt,"state");        if(v>=0) g_state.state=(int)tok_long(payload,&tk[v]);
-    v=find_val(payload,tk,nt,"playing_num");  if(v>=0) copy_tok(payload,&tk[v],g_state.playing_num,sizeof g_state.playing_num);
-    v=find_val(payload,tk,nt,"work_mode");    if(v>=0) copy_tok(payload,&tk[v],g_state.work_mode,sizeof g_state.work_mode);
-    v=find_val(payload,tk,nt,"love");         if(v>=0) g_state.is_favorite=tok_bool(payload,&tk[v]);
-    v=find_val(payload,tk,nt,"song");
+    /* Parse the "song" object BEFORE taking g_mu: it only fills these locals (and the IPC-thread-only title cache),
+     * and fix_filename_title may wait on the library DB, which must never stall the UI thread's ipc_get_state. */
+    enum { SONG_ABSENT, SONG_TRACK, SONG_CLEAR } song_act = SONG_ABSENT;
+    char t_title[sizeof g_state.title]={0}, t_artist[sizeof g_state.artist]={0};
+    char t_album[sizeof g_state.album]={0}, t_path[sizeof g_state.path]={0};
+    long t_dur=-1, t_pos=-1; int t_sr=-1, t_dsd=-1;
+    int v=find_val(payload,tk,nt,"song");
     if(v>=0 && tk[v].type==JSMN_STRING && (tk[v].end-tk[v].start)>2){
         static char song[8192];   /* match the 8192 /player queue: a long escaped CJK/path song
                                     * JSON must not truncate here (truncation -> jsmn parse fail ->
@@ -160,9 +160,7 @@ static void parse_a2(const char*payload,int len){
              * leave the PREVIOUS path (and path_seq) intact while the title changes, so the new song's
              * positions would bind to the old track and corrupt its bookmark. unescape (not copy_tok) every
              * string: the inner song JSON still carries \/ \" \uXXXX after the outer unescape. */
-            char t_title[sizeof g_state.title]={0}, t_artist[sizeof g_state.artist]={0};
-            char t_album[sizeof g_state.album]={0}, t_path[sizeof g_state.path]={0};
-            long t_dur=-1, t_pos=-1; int t_sr=-1, t_dsd=-1, have_path=0, sv;
+            int have_path=0, sv;
             sv=find_val(song,st,n2,"song_name");          if(sv>=0) unescape(song+st[sv].start, st[sv].end-st[sv].start, t_title,  sizeof t_title);
             sv=find_val(song,st,n2,"song_artist_name");   if(sv>=0) unescape(song+st[sv].start, st[sv].end-st[sv].start, t_artist, sizeof t_artist);
             sv=find_val(song,st,n2,"song_album_name");    if(sv>=0) unescape(song+st[sv].start, st[sv].end-st[sv].start, t_album,  sizeof t_album);
@@ -173,21 +171,13 @@ static void parse_a2(const char*payload,int len){
             sv=find_val(song,st,n2,"song_sample_rate");   if(sv>=0) t_sr=(int)tok_long(song,&st[sv]);
             sv=find_val(song,st,n2,"is_dsd");             if(sv>=0) t_dsd=tok_bool(song,&st[sv]);
             sv=find_val(song,st,n2,"pos_id");             if(sv>=0) t_pos=tok_long(song,&st[sv]);
-            if(have_path){                 /* complete identity -> publish the whole track atomically */
+            if(have_path){                 /* complete identity -> publish the whole track atomically (below) */
                 fix_filename_title(t_title, (int)sizeof t_title, t_path);
-                snprintf(g_state.path,   sizeof g_state.path,   "%s", t_path);
-                snprintf(g_state.title,  sizeof g_state.title,  "%s", t_title);
-                snprintf(g_state.artist, sizeof g_state.artist, "%s", t_artist);
-                snprintf(g_state.album,  sizeof g_state.album,  "%s", t_album);
-                if(t_dur>=0) g_state.duration_ms=t_dur;
-                if(t_sr>=0)  g_state.sample_rate=t_sr;
-                if(t_dsd>=0) g_state.is_dsd=t_dsd;
-                g_state.pos_id = (t_pos>0 && t_pos<=0x7FFFFFFF) ? (int)t_pos : 0;   /* per track: never carried over from the previous one */
-                g_state.have_track=1;
+                song_act = SONG_TRACK;
             } else {
                 /* a present song with NO usable path can't establish identity -> clear rather than bind new
                  * positions to the previous track (which would corrupt its bookmark). */
-                clear_track();
+                song_act = SONG_CLEAR;
             }
         }
     } else if(v>=0 && tk[v].type==JSMN_STRING){
@@ -202,8 +192,25 @@ static void parse_a2(const char*payload,int len){
          * NB: this only handles the present-but-empty stop encoding. If the player
          * ever signals stop via a song-ABSENT short frame, that needs a captured
          * stop frame to confirm + a state-based oracle. */
-        clear_track();
+        song_act = SONG_CLEAR;
     }
+    pthread_mutex_lock(&g_mu);
+    char oldpath[256]; snprintf(oldpath, sizeof oldpath, "%s", g_state.path);   /* detect a track-identity change */
+    v=find_val(payload,tk,nt,"state");        if(v>=0) g_state.state=(int)tok_long(payload,&tk[v]);
+    v=find_val(payload,tk,nt,"playing_num");  if(v>=0) copy_tok(payload,&tk[v],g_state.playing_num,sizeof g_state.playing_num);
+    v=find_val(payload,tk,nt,"work_mode");    if(v>=0) copy_tok(payload,&tk[v],g_state.work_mode,sizeof g_state.work_mode);
+    v=find_val(payload,tk,nt,"love");         if(v>=0) g_state.is_favorite=tok_bool(payload,&tk[v]);
+    if(song_act == SONG_TRACK){
+        snprintf(g_state.path,   sizeof g_state.path,   "%s", t_path);
+        snprintf(g_state.title,  sizeof g_state.title,  "%s", t_title);
+        snprintf(g_state.artist, sizeof g_state.artist, "%s", t_artist);
+        snprintf(g_state.album,  sizeof g_state.album,  "%s", t_album);
+        if(t_dur>=0) g_state.duration_ms=t_dur;
+        if(t_sr>=0)  g_state.sample_rate=t_sr;
+        if(t_dsd>=0) g_state.is_dsd=t_dsd;
+        g_state.pos_id = (t_pos>0 && t_pos<=0x7FFFFFFF) ? (int)t_pos : 0;   /* per track: never carried over from the previous one */
+        g_state.have_track=1;
+    } else if(song_act == SONG_CLEAR) clear_track();
     g_state.seq++;
     if(strcmp(oldpath, g_state.path) != 0) g_state.path_seq = g_state.seq;   /* track changed -> new identity epoch */
     pthread_mutex_unlock(&g_mu);
